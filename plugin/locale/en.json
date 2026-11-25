@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Models from WorkBuddy",
+    "description": "Use this machine's logged-in WorkBuddy models (DeepSeek / GLM / Kimi / MiniMax / Hunyuan) inside DeepSeek Harness through a local bridge. The workbuddy provider appears in the model picker after the desktop app is signed in."
+  }
+}

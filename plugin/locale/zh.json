@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "接入 WorkBuddy 模型",
+    "description": "通过本地桥把本机 WorkBuddy 桌面端已登录的模型（DeepSeek / GLM / Kimi / MiniMax / 混元等）接进 DeepSeek Harness：桌面端登录后，模型选择器里直接多出 workbuddy 一路。"
+  }
+}

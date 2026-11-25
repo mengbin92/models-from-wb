@@ -1,0 +1,12 @@
+# 参照项目的本地克隆（不属于本仓库，内容见 README 的链接）
+reference/
+
+# 依赖与构建产物（本项目零依赖，防御性忽略）
+node_modules/
+*.log
+
+# 系统垃圾
+.DS_Store
+
+# 本地运行时数据（桥的账本/状态如未来落盘）
+.workbuddy-bridge/

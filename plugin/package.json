@@ -1,0 +1,46 @@
+{
+  "name": "models-from-wb",
+  "version": "0.1.0",
+  "private": true,
+  "description": "DeepSeek Harness 插件：把本机 WorkBuddy 桌面端已登录的模型（DeepSeek / GLM / Kimi / MiniMax / 混元等）经本地桥原生接进 dsh —— 运行时注册 workbuddy 路由，模型直接出现在模型选择器。",
+  "type": "module",
+  "license": "MIT",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "lib",
+    "bridge",
+    "cordis.patch.yml",
+    "locale",
+    "icon.svg",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mengbin92/models-from-wb.git",
+    "directory": "plugin"
+  },
+  "homepage": "https://github.com/mengbin92/models-from-wb",
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "dsh-bundle",
+    "workbuddy",
+    "llm-provider",
+    "openai-compatible"
+  ]
+}
