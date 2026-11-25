@@ -30,8 +30,9 @@ dsh 模型选择器 ──▶ 插件适配器（dsh 词汇 ↔ OpenAI 词汇）
 
 1. 确认 WorkBuddy 桌面端已登录（凭据在
    `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info`）；
-2. 插件已安装并启用（dsh 设置 → 插件 → `models-from-wb`）；桥会自动拉起
-   （`127.0.0.1:8790`，只监听回环）；
+2. 安装插件：设置 → 插件 → 添加插件，填
+   **`github:mengbin92/models-from-wb`**（或本地 `plugin/` 目录的绝对路径）；
+   重启一次 dsh。桥会自动拉起（`127.0.0.1:8790`，只监听回环）；
 3. 模型选择器里选 `WorkBuddy` 分组的模型，直接对话——**免费模型排最前，其余按
    积分倍率升序，倍率未知的排最后**（选择器不自己排序，顺序由适配器决定）；
 4. 积分：`/workbuddy credits` 看余额，`/workbuddy models` 看全部模型与倍率。
