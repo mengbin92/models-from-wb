@@ -12,14 +12,17 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  channelFallbackCandidates,
   clientExeCandidates,
   deriveAtRestKey,
   deriveAtRestKeyId,
   envelopeKeyId,
   findClientExe,
+  isChannelRejection,
   normalizePayload,
   openEncryptedField,
   resolveAuthPath,
+  sanitizeText,
   shapeCatalog,
   upstreamForDomain,
 } from '../plugin/bridge/wb-bridge.mjs';
@@ -181,7 +184,112 @@ test('resolveAuthPath: 无 env 时给出本机真实路径或空串（都不报�
   }
 });
 
-// ── 目录整形：v3 驼峰字段 + 不覆盖合并 ─────────────────────────────────
+// ── 11128 通道指纹防御 ─────────────────────────────────────────────────
+
+test('sanitizeText: dsh 身份句被中和（根因：上游 400 code 11128）', () => {
+  // 本机实测：system 含此句 → 400 11128；换成中性表述后同 messages/tools 全 200
+  const out = sanitizeText("You are an AI agent powered by DeepSeek Harness. Be concise.");
+  assert.ok(!/powered by DeepSeek\s+Harness/i.test(out), '身份句必须被中和');
+  assert.match(out, /running inside the user's development environment/);
+  assert.match(out, /Be concise/, '其余指令保留');
+});
+
+test('sanitizeText: 带版本后缀的身份句也中和', () => {
+  const out = sanitizeText('You are an AI agent powered by DeepSeek Harness v0.2.2-rc.5.');
+  assert.ok(!/powered by DeepSeek/i.test(out));
+});
+
+test('sanitizeText: 模型自述句与 system 品牌词', () => {
+  assert.match(
+    sanitizeText('You are a coding agent powered by the cn-deepseek-v4.1-flash-0.11x model.'),
+    /running in the user's development environment/,
+  );
+  // system 里其余行的品牌词 → 中性称呼（不删行，保留该行指令）。
+  // 注意：中性词自带 "the"，原句 "names the DeepSeek Harness" 会变成
+  // "names the the local runtime"——读着别扭但语义无损，且只影响发给模型的
+  // 系统提示（用户在界面上看到的回答不含它）。参考项目同款取舍。
+  const branded = sanitizeText('Be terse.\nThe runtime context names the DeepSeek Harness implementation checkout.');
+  assert.ok(!/DeepSeek\s+Harness/i.test(branded));
+  assert.match(branded, /The runtime context names the the local runtime implementation checkout\./);
+  assert.match(branded, /^Be terse\./, '其余行原样保留');
+});
+
+test('sanitizeText: assistant 作用域只洗身份模板，不碰普通正文', () => {
+  // assistant 正文可能是用户正在看的回答：品牌词不替换，只洗两句精确模板
+  const out = sanitizeText(
+    '我刚才查了 DeepSeek Harness 的文档。\nYou are an AI agent powered by DeepSeek Harness.',
+    'assistant',
+  );
+  assert.match(out, /我刚才查了 DeepSeek Harness 的文档/, 'assistant 普通正文里的品牌词不动');
+  assert.ok(!/powered by DeepSeek/i.test(out), 'assistant 里的身份模板句仍要洗');
+});
+
+test('sanitizeText: 无命中返回原值', () => {
+  const text = 'You are a helpful assistant.';
+  assert.equal(sanitizeText(text), text);
+  assert.equal(sanitizeText('', 'system'), '');
+  assert.equal(sanitizeText(undefined), undefined);
+  // 非字符串（图片段数组等）原样返回
+  const arr = [{ type: 'text', text: 'x' }];
+  assert.equal(sanitizeText(arr), arr);
+});
+
+test('normalizePayload: system 与 assistant 历史都过中和', () => {
+  const payload = normalizePayload({
+    messages: [
+      { role: 'system', content: 'You are an AI agent powered by DeepSeek Harness.' },
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'You are an AI agent powered by DeepSeek Harness.' },
+    ],
+  });
+  assert.ok(!/powered by DeepSeek/i.test(payload.messages[0].content));
+  assert.ok(!/powered by DeepSeek/i.test(payload.messages[2].content));
+  // user 内容永不动
+  assert.equal(payload.messages[1].content, 'hi');
+});
+
+test('isChannelRejection: 识别 11128 响应体', () => {
+  assert.ok(isChannelRejection('{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}'));
+  assert.ok(isChannelRejection('code 11128 first message is not system'));
+  assert.ok(!isChannelRejection('{"code":11133,"msg":"model_param_invalid"}'));
+  assert.ok(!isChannelRejection(''));
+});
+
+test('channelFallbackCandidates: 渐进顺序 + 不动 user/tools', () => {
+  const payload = {
+    model: 'm',
+    tools: [{ type: 'function', function: { name: 'bash' } }],
+    messages: [
+      { role: 'system', content: '身份段一。\n\nThe DeepSeek Harness runtime rules here.' },
+      { role: 'user', content: '帮我看看 DeepSeek Harness 怎么装' },
+      { role: 'tool', tool_call_id: 'c1', content: 'ok' },
+    ],
+  };
+  const candidates = channelFallbackCandidates(payload);
+  const strategies = candidates.map((c) => c.strategy);
+  // 删品牌行（system 第二段含品牌）→ 删首段 → 中性 system
+  assert.deepEqual(strategies, ['remove-brand-lines', 'drop-first-system-paragraph', 'neutral-system']);
+  for (const c of candidates) {
+    // user / tool 永远不动
+    assert.equal(c.payload.messages.find((m) => m.role === 'user').content, '帮我看看 DeepSeek Harness 怎么装');
+    assert.ok(c.payload.messages.some((m) => m.role === 'tool'));
+    // tools 不动
+    assert.deepEqual(c.payload.tools, payload.tools);
+  }
+  // 最后一级把 system 整段换成中性
+  const neutral = candidates.at(-1);
+  assert.equal(neutral.payload.messages[0].content, 'You are a helpful AI assistant.');
+  assert.equal(neutral.payload.messages.length, 3);
+});
+
+test('channelFallbackCandidates: 无 system / 无命中时不给候选（中性兜底除外）', () => {
+  assert.deepEqual(channelFallbackCandidates({ messages: [{ role: 'user', content: 'hi' }] }), []);
+  // 干净的单段 system：只有最后的中性兜底
+  const clean = channelFallbackCandidates({ messages: [{ role: 'system', content: 'Be terse.' }] });
+  assert.deepEqual(clean.map((c) => c.strategy), ['neutral-system']);
+  assert.deepEqual(channelFallbackCandidates({}), []);
+  assert.deepEqual(channelFallbackCandidates(null), []);
+});
 
 test('shapeCatalog: v3 的驼峰容量字段必须被映射（下划线写法全是 0）', () => {
   // 真实事故：v3 用 maxInputTokens/maxOutputTokens（驼峰），只认下划线会把

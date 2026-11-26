@@ -20,7 +20,7 @@ dsh 模型选择器 ──▶ 插件适配器（dsh 词汇 ↔ OpenAI 词汇）
 |---|---|
 | [`docs/DESIGN.md`](docs/DESIGN.md) | 设计文档：WorkBuddy 授权认证机制（实测）、上游契约、架构、与参考项目的差异 |
 | [`plugin/`](plugin/) | dsh bundle：`lib/index.js`（宿主端）、`lib/adapter.mjs`（LLM 适配器）、`bridge/wb-bridge.mjs`（本地桥） |
-| [`test/`](test/) | node:test 单元 + 集成测试（57 例，含真机凭据解密） |
+| [`test/`](test/) | node:test 单元 + 集成测试（73 例，含真机凭据解密） |
 
 ## 快速开始
 

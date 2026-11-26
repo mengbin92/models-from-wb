@@ -50,6 +50,9 @@ const HINTS = {
 /** 上游错误文本 → dsh 失败码。 */
 export function classifyError(message, status) {
   const text = String(message || '');
+  // 11128 是「来源/模板校验」拦截，不是参数拒绝——先于 400 的通用归类，
+  // 否则提示会把人引向「换个模型/恢复默认参数」的白折腾方向。
+  if (/\b11128\b|illegal api invocation|unapproved channel|first message is not system/i.test(text)) return CODE.INVALID;
   if (/\b6004\b|\b6008\b|\b14018\b|usage exceeds frequency limit|使用量已超出频率限制|积分(?:已)?耗尽|quota (?:exhausted|exceeded)|insufficient/i.test(text)) return CODE.QUOTA;
   if (status === 402) return CODE.QUOTA;
   if (/\b6020\b|\b6021\b|\b6022\b|模型排队|queue (?:full|waiting)/i.test(text)) return CODE.MODEL_QUEUE;
@@ -67,7 +70,13 @@ export function classifyError(message, status) {
   return 'PROVIDER_ERROR';
 }
 
-function hintFor(code, detail) {
+export function hintFor(code, detail) {
+  const text = String(detail || '');
+  // 11128：桥已在发送前中和 dsh 的身份句、并对 11128 做渐进兜底；走到这里
+  // 说明上游新增了黑名单句式。给的是「看桥日志」而不是「换个模型」。
+  if (/\b11128\b|illegal api invocation|unapproved channel|first message is not system/i.test(text)) {
+    return '上游拦截了这次调用的来源或模板（code 11128）—— 桥已自动中和系统提示里的宿主身份句并降级重试；仍失败请查看桥日志（stderr）里的 11128 fallback 记录，并把该行反馈到 issue。';
+  }
   return HINTS[code] || '';
 }
 

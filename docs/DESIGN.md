@@ -115,7 +115,7 @@ Authorization: Bearer <refreshToken>
 | `www.workbuddy.cn` / `www.codebuddy.cn`（国内） | `https://copilot.tencent.com` |
 | `workbuddy.ai` / `workbuddy.cc`（国际） | `https://www.workbuddy.ai` |
 
-### 2.2 聊天：OpenAI 协议 + 四条不成文约束
+### 2.2 聊天：OpenAI 协议 + 五条不成文约束
 
 `POST {网关}/v2/chat/completions`，请求体就是 OpenAI Chat Completions。
 上游比规范更严，直接转发会被 400：
@@ -125,7 +125,22 @@ Authorization: Bearer <refreshToken>
 | 只接受流式（`stream:true`） | `400 code 11101` | 非流式请求内部转流式再聚合 |
 | 不识别 `developer` 角色 | `400 code 11128` | 重写为 `system` |
 | `tool_choice` 只认字符串 | `400 code 11101` | 对象形式归一化为 `required`/丢弃 |
-| 校验调用方身份 | `400 code 11128` | 请求头伪装成官方客户端 |
+| 校验调用方身份（请求头） | `400 code 11128` | 请求头伪装成官方客户端 |
+| 校验调用方身份（**system 内容**） | `400 code 11128` | 中和宿主身份句 + 渐进兜底（见下） |
+
+第五条是 2026-10-21 上游变更起的**通道指纹**：system 里出现
+`You are an AI agent powered by DeepSeek Harness.` 就直接 11128——dsh 的系统
+提示首句正是这句话，不处理则每一轮都被拦（本机实测：换成中性表述后同样的
+messages/tools 全部 200）。桥的两条防线：
+
+1. **发送前中和**（`sanitizeText`）：三组已知身份模板句最小改写 + system 品牌词
+   中性化（`DeepSeek Harness` → `the local runtime`，不删行以免丢语义）；
+   assistant 历史只洗那两句精确模板——历史里的同一句会让之后每轮都挂
+   （同类项目实证），但普通正文不碰（那是用户正在看的回答）；
+2. **11128 渐进兜底**（`channelFallbackCandidates`）：上游再新增黑名单时，按
+   「删 system 品牌行 → 删第一条 system 首段 → 整段中性 system」降级重试，
+   成功时响应头带 `X-WorkBuddy-11128-Fallback: <策略>`。user / tool / tools
+   永远不动。
 
 身份头（对齐官方桌面端，实测可用）：
 

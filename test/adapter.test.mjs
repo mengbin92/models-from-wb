@@ -11,6 +11,7 @@ import {
   CODE,
   WorkBuddyAdapter,
   classifyError,
+  hintFor,
   mapFinishReason,
   mapUsage,
   stripCostSuffix,
@@ -106,6 +107,13 @@ test('classifyError: 上游业务码 → dsh 失败码', () => {
 test('classifyError: 额度优先于 429（避免白重试）', () => {
   // 6004 是账号级用量上限，归 RATE_LIMIT 会让 dsh 退避重试再报同一个错
   assert.equal(classifyError('6004 usage exceeds frequency limit', 429), CODE.QUOTA);
+});
+
+test('classifyError: 11128 归 INVALID 且优先于 400 通用归类', () => {
+  // 400 的通用归类会把 11128 当成「参数被拒」，提示随之指错方向
+  const code = classifyError('upstream 400: {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}', 400);
+  assert.equal(code, CODE.INVALID);
+  assert.match(hintFor(code, 'upstream 400: {"code":11128,"msg":"Illegal API invocation from an unapproved channel"}'), /11128/);
 });
 
 // ── wire 工具表 ───────────────────────────────────────────────────────

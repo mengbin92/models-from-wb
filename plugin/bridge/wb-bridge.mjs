@@ -861,6 +861,7 @@ function isChatModel(m) {
  *   2. 不认 developer 角色 → 重写为 system
  *   3. tool_choice 只认字符串 → 对象归一化为 required / 认不出的丢弃
  *   4. 首条消息最好是 system（国际版强制）→ 必要时补一条中性的
+ *   5. system 里的宿主身份句 → 中和（上游 11128 通道指纹，见 sanitizeText）
  */
 export function normalizePayload(body) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -868,16 +869,136 @@ export function normalizePayload(body) {
   for (const m of messages) {
     if (!m || typeof m !== 'object') continue;
     const role = m.role === 'developer' ? 'system' : String(m.role || '');
-    out.push({ ...m, role });
+    if (role === 'system' || role === 'assistant') {
+      out.push({ ...m, role, content: sanitizeText(m.content, role) });
+    } else {
+      out.push({ ...m, role });
+    }
   }
   if (out.length && out[0].role !== 'system') {
-    out.unshift({ role: 'system', content: 'You are a helpful assistant.' });
+    out.unshift({ role: 'system', content: NEUTRAL_SYSTEM });
   }
   const payload = { ...body, messages: out, stream: true };
   if (payload.tool_choice && typeof payload.tool_choice === 'object') {
     payload.tool_choice = payload.tool_choice.type === 'function' ? 'required' : 'auto';
   }
   return payload;
+}
+
+// ── 上游 11128（通道模板校验）防御 ─────────────────────────────────────
+
+/**
+ * 上游会把 system 里的**宿主身份句**当通道指纹，命中即
+ * `400 code 11128 Illegal API invocation from an unapproved channel`
+ * （2026-10-21 上游变更起；本机实测：把身份句换成中性表述后，同样的
+ * messages / tools 全部 200）。dsh 的系统提示首句正是这句话，不中和的话
+ * 每一轮都会被拦。
+ *
+ * 两条防线：
+ *   ① 发送前中和（sanitizeText，零成本）：已知身份模板句最小改写 + 品牌词
+ *      中性化；assistant 历史只洗那两句精确模板（历史里的同一句会让之后
+ *      每轮都挂，同类项目实证），不碰普通正文；
+ *   ② 11128 渐进兜底（channelFallbackCandidates）：上游再新增黑名单时，
+ *      按「删品牌行 → 删首段 → 整段中性 system」降级重试。
+ */
+
+/** 固定先后共现会被当成通道指纹的句子（单独出现不拦）。 */
+const AUDIT_TEMPLATE_REWRITES = [
+  ['Tokens prefixed with @ are paths the user explicitly referenced.',
+    'Tokens prefixed with an at-sign are paths the user explicitly referenced.'],
+];
+/** `You are an AI agent powered by DeepSeek Harness[版本后缀].`（含可选版本号）。 */
+const DSH_IDENTITY_RE = /You are an AI agent powered by DeepSeek\s+Harness(?:\s+(?:version|build|v)?\s*\d+(?:\.\d+){0,3}(?:[-+][0-9A-Za-z.-]+)?)?\.?/gi;
+const DSH_IDENTITY_NEUTRAL = "You are an AI agent running inside the user's development environment.";
+/** `You are a coding agent powered by the <模型名> model.`（模型名允许带点）。 */
+const DSH_AGENT_MODEL_RE = /You are a coding agent powered by the [^\n]{1,120}? model\./gi;
+const DSH_AGENT_MODEL_NEUTRAL = "You are a coding agent running in the user's development environment.";
+/** system 里其余行的品牌词：不能删整行（丢语义），换成中性称呼。 */
+const DSH_BRAND_RE = /\bDeepSeek\s+Harness\b/gi;
+const DSH_BRAND_NEUTRAL = 'the local runtime';
+
+const NEUTRAL_SYSTEM = 'You are a helpful AI assistant.';
+
+/** 响应体是否是上游的「通道/模板校验」拒绝（400 code 11128）。 */
+export function isChannelRejection(text) {
+  return /"code"\s*:\s*11128|11128/i.test(String(text || ''));
+}
+
+/**
+ * system / assistant 文本的最小中和；无命中返回原值（引用不变）。
+ *
+ * `assistant` 作用域只洗两句精确身份模板，不做品牌词替换——assistant 正文
+ * 可能是用户正在看的回答，广泛改写会改变语义。system 才是模板指纹的主要
+ * 来源，允许把其余品牌词中性化。
+ */
+export function sanitizeText(text, scope = 'system') {
+  if (typeof text !== 'string' || text === '') return text;
+  let out = text;
+  for (const [from, to] of AUDIT_TEMPLATE_REWRITES) {
+    if (out.includes(from)) out = out.split(from).join(to);
+  }
+  out = out.replace(DSH_IDENTITY_RE, DSH_IDENTITY_NEUTRAL);
+  out = out.replace(DSH_AGENT_MODEL_RE, DSH_AGENT_MODEL_NEUTRAL);
+  if (scope !== 'assistant') out = out.replace(DSH_BRAND_RE, DSH_BRAND_NEUTRAL);
+  return out;
+}
+
+/**
+ * 11128 的渐进降级候选（调用方只在仍收到 11128 时才继续试下一个）。
+ * 顺序从「动得最少」到「牺牲 system」；user / tool / tools 永远不动。
+ *
+ * @returns {Array<{strategy: string, payload: object}>} 去重后的候选
+ */
+export function channelFallbackCandidates(payload) {
+  const messages = Array.isArray(payload?.messages) ? payload.messages : [];
+  const isSystem = (m) => m && (m.role === 'system' || m.role === 'System');
+  if (!messages.some(isSystem)) return [];
+
+  const out = [];
+  const seen = new Set();
+  const push = (strategy, nextMessages) => {
+    const key = JSON.stringify(nextMessages);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ strategy, payload: { ...payload, messages: nextMessages } });
+  };
+
+  // 1) 只删 system 里含宿主品牌的整行，其余 instructions 原样保留
+  let changed = false;
+  const trimmed = messages.map((m) => {
+    if (!isSystem(m) || typeof m.content !== 'string') return m;
+    const next = m.content
+      .split(/\r?\n/)
+      .filter((line) => !/deepseek\s+harness/i.test(line))
+      .join('\n')
+      .trim();
+    if (next !== m.content) changed = true;
+    return { ...m, content: next };
+  }).filter((m) => !(isSystem(m) && !m.content));
+  if (changed && trimmed.some(isSystem)) push('remove-brand-lines', trimmed);
+
+  // 2) 只删第一条 system 的首段（身份/人格通常在第一段），保留后面的
+  //    skills/workspace/安全规则
+  let dropped = false;
+  let firstSystemSeen = false;
+  const droppedMessages = messages.map((m) => {
+    if (!isSystem(m) || typeof m.content !== 'string' || firstSystemSeen) return m;
+    firstSystemSeen = true;
+    const parts = m.content.split(/\r?\n\s*\r?\n/);
+    if (parts.length < 2) return m;
+    const next = parts.slice(1).join('\n\n').trim();
+    if (!next) return m;
+    dropped = true;
+    return { ...m, content: next };
+  }).filter((m) => !(isSystem(m) && !m.content));
+  if (dropped && droppedMessages.some(isSystem)) push('drop-first-system-paragraph', droppedMessages);
+
+  // 3) 最后手段：整段中性 system，保住这次调用
+  push('neutral-system', [
+    { role: 'system', content: NEUTRAL_SYSTEM },
+    ...messages.filter((m) => !isSystem(m)),
+  ]);
+  return out;
 }
 
 // ── HTTP 服务 ─────────────────────────────────────────────────────────
@@ -1049,20 +1170,58 @@ async function handleChat(req, res) {
   const signal = UPSTREAM_TIMEOUT_MS > 0
     ? AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
     : undefined;
+  const postUpstream = (p) => fetch(`${auth.auth.endpoint}/v2/chat/completions`, {
+    method: 'POST',
+    headers: upstreamHeaders(auth.auth, model, conversationId),
+    body: JSON.stringify(p),
+    ...(signal ? { signal } : {}),
+  });
+
   let upstream;
   try {
-    upstream = await fetch(`${auth.auth.endpoint}/v2/chat/completions`, {
-      method: 'POST',
-      headers: upstreamHeaders(auth.auth, model, conversationId),
-      body: JSON.stringify(payload),
-      ...(signal ? { signal } : {}),
-    });
+    upstream = await postUpstream(payload);
   } catch (error) {
     sendJson(res, 502, { error: { message: `upstream request failed: ${error?.message || error}`, type: 'transport_error' } });
     return;
   }
+  /*
+   * 11128 渐进兜底：上游把 system 里的宿主身份句当通道指纹。发送前的
+   * sanitizeText 已中和已知句式；这里防上游**新增**的黑名单——按
+   * channelFallbackCandidates 的顺序降级重试，成功即采用（响应头带上
+   * 用了哪级策略，便于排查）。user / tool / tools 不动。
+   */
+  if (upstream.status === 400) {
+    const firstText = await upstream.text().catch(() => '');
+    if (isChannelRejection(firstText)) {
+      for (const candidate of channelFallbackCandidates(payload)) {
+        let retry;
+        try {
+          retry = await postUpstream(candidate.payload);
+        } catch { break; }
+        if (retry.ok && retry.body) {
+          log(`11128 fallback applied: ${candidate.strategy}`);
+          upstream = retry;
+          res.setHeader('X-WorkBuddy-11128-Fallback', candidate.strategy);
+          break;
+        }
+        const retryText = await retry.text().catch(() => '');
+        if (!isChannelRejection(retryText)) {
+          // 不是通道问题了（换成别的错）：采用这个响应，让下面的统一错误处理说话
+          upstream = retry;
+          upstream.__errorText = retryText;
+          break;
+        }
+      }
+      // 所有降级都仍是通道拒绝：保留首次错误的原文上报
+      if (!upstream.ok && !upstream.__errorText) upstream.__errorText = firstText;
+    } else {
+      upstream.__errorText = firstText;
+    }
+  } else if (!upstream.ok && !upstream.body) {
+    upstream.__errorText = await upstream.text().catch(() => '');
+  }
   if (!upstream.ok || !upstream.body) {
-    const text = await upstream.text().catch(() => '');
+    const text = upstream.__errorText ?? '';
     // 只透传协议层归因；上游错误体一般不含令牌，但仍截断防呆
     sendJson(res, 502, {
       error: {
