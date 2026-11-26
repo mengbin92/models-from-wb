@@ -159,6 +159,20 @@ MiMo-V2.6-Pro 等；`hy4flash-free` 为 `x0.00` 免费档。
 `x0.00` / `free:true`；「未知倍率」不标免费——把未知当免费是对用户的钱包撒谎。
 倍率同时进模型名后缀（选择器逐字渲染 name）与模型详情 description。
 
+**两个实测踩过的坑**（2026-11-26 修复，commit `修复切模型被 compaction 拒绝`）：
+
+1. **v3 的字段是驼峰**（`maxInputTokens` / `maxOutputTokens` / `supportsImages` /
+   `descriptionZh` / `reasoning.supportedEfforts`），v2 才是下划线。只认一种命名
+   会把容量信息全部映射成 0——下游症状是 dsh 切模型时报
+   `no context capacity … configure contextWindow`，与凭据/网络毫无关系，极难误判。
+2. **合并不能无条件覆盖**：v2 条目大量字段缺失、归一成 0/空串，`{...v3, ...v2}`
+   会把 v3 的 960000 上下文盖成 0。合并规则改为「后来的来源只补有意义的值」。
+
+**上下文容量必须始终给**：dsh 的 compaction-basic 拿不到 `contextWindow` 就拒绝
+切模型。适配器因此总是返回容量——真实值优先，目录缺失（少数路由别名型号）时给
+保守下限 32K：低估只会让 dsh 更早压缩（安全方向），高估会把超长请求发给上游、
+换一个 400。
+
 ### 2.4 计费：余额查询（只读，不消耗积分）
 
 计费网关与 chat 网关**不是同一个主机**，跟随登录域名：
