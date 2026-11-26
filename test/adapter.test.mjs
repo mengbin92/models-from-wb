@@ -374,5 +374,45 @@ test('integration: 目录失败时 resolveModel 退回最小元数据（不误�
 
   const adapter = new WorkBuddyAdapter({ provider: 'workbuddy', baseUrl: bridge.baseUrl });
   const resolved = await adapter.resolveModel('workbuddy', 'anything');
-  assert.deepEqual(resolved, { provider: 'workbuddy', id: 'anything', name: 'anything' });
+  // 仍带保守容量： compaction 拿不到 contextWindow 会拒绝切模型
+  assert.deepEqual(resolved, {
+    provider: 'workbuddy',
+    id: 'anything',
+    name: 'anything',
+    context: { contextWindow: 32768 },
+  });
+});
+
+test('integration: resolveModel 报真实上下文容量（切模型不再被 compaction 拒）', async (t) => {
+  const bridge = await startFakeBridge((req, res) => {
+    if (req.url === '/v1/models') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ data: [
+        { id: 'hy4flash-free', name: 'Hy4 flash · 免费', credits: 'x0.00', context_window: 960000, max_output_tokens: 64000 },
+      ] }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+    res.end(sse(textFrames));
+  });
+  t.after(() => bridge.close());
+
+  const adapter = new WorkBuddyAdapter({ provider: 'workbuddy', baseUrl: bridge.baseUrl });
+  const resolved = await adapter.resolveModel('workbuddy', 'hy4flash-free');
+  assert.equal(resolved.context.contextWindow, 960000);
+  assert.equal(resolved.defaultMaxTokens, 64000);
+  assert.match(resolved.description, /上下文 960K/);
+  assert.match(resolved.description, /输出 64K/);
+});
+
+test('integration: resolveModel 目录缺容量时给保守下限（不裸奔）', async (t) => {
+  const bridge = await startFakeBridge((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ data: [{ id: 'mystery', name: 'Mystery' }] }));
+  });
+  t.after(() => bridge.close());
+
+  const adapter = new WorkBuddyAdapter({ provider: 'workbuddy', baseUrl: bridge.baseUrl });
+  const resolved = await adapter.resolveModel('workbuddy', 'mystery');
+  assert.equal(resolved.context.contextWindow, 32768, '未知容量 → 保守下限，杜绝 no context capacity');
 });

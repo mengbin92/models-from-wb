@@ -699,17 +699,46 @@ async function upstreamGet(auth, path) {
  * 模型目录：/v3/config（官方选择器真源）与 /v2/enterprises/personal/models
  * （全量 + 倍率）**都请求、按 id 合并**——单用任何一个都会漏模型。
  */
-export async function fetchCatalog(auth) {
+/**
+ * 模型目录整形（纯函数，便于单测）：
+ *   · v3 = 官方模型选择器真源（字段**驼峰**：maxInputTokens/maxOutputTokens/
+ *     supportsImages/reasoning.supportedEfforts…）；
+ *   · v2 = 网关全量（字段下划线 + credits 倍率），补 v3 没列的型号；
+ *   · 合并规则：**后来的来源只补「有意义的值」**——v2 大量字段缺失会归一成
+ *     0/空串，若无条件覆盖会把 v3 的真值（如 960000 上下文）盖成 0。
+ *
+ * @param {object} v3Json `GET /v3/config` 的响应 JSON
+ * @param {object} v2Json `GET /v2/enterprises/personal/models` 的响应 JSON
+ * @returns {object[]} 合并后的模型条目
+ */
+export function shapeCatalog(v3Json, v2Json) {
   const out = new Map();
+  /** 只有「有意义」的值才允许覆盖：0/空串/undefined 不盖掉已有真值。 */
+  const meaningful = (v) => {
+    if (v === undefined || v === null) return false;
+    if (typeof v === 'number') return Number.isFinite(v) && v !== 0;
+    if (typeof v === 'string') return v.length > 0;
+    if (typeof v === 'boolean') return v === true;
+    if (Array.isArray(v)) return v.length > 0;
+    return true;
+  };
   const put = (m) => {
     if (!m || typeof m.id !== 'string' || !m.id) return;
     const prev = out.get(m.id);
-    out.set(m.id, { ...prev, ...m, id: m.id });
+    if (!prev) {
+      out.set(m.id, { ...m, id: m.id });
+      return;
+    }
+    const merged = { ...prev };
+    for (const [k, v] of Object.entries(m)) {
+      if (k !== 'id' && meaningful(v)) merged[k] = v;
+    }
+    out.set(m.id, merged);
   };
-  // v3：官方真源（models + agents[].models）
+
+  // v3：官方真源
   try {
-    const config = await upstreamGet(auth, '/v3/config');
-    const data = config?.data || config || {};
+    const data = v3Json?.data || v3Json || {};
     for (const m of Array.isArray(data.models) ? data.models : []) put(normalizeV3(m));
     for (const agent of Array.isArray(data.agents) ? data.agents : []) {
       for (const m of Array.isArray(agent.models) ? agent.models : []) {
@@ -731,17 +760,30 @@ export async function fetchCatalog(auth) {
       }
     }
   } catch (error) {
-    log('catalog /v3/config failed', error?.message || error);
+    log('catalog /v3/config shaping failed', error?.message || error);
   }
   // v2：全量 + 倍率/标签
   try {
-    const list = await upstreamGet(auth, '/v2/enterprises/personal/models');
-    const models = list?.data?.models || list?.models || (Array.isArray(list?.data) ? list.data : []);
-    for (const m of Array.isArray(models) ? models : []) put(normalizeV2(m));
+    const list = v2Json?.data?.models || v2Json?.models || (Array.isArray(v2Json?.data) ? v2Json.data : []);
+    for (const m of Array.isArray(list) ? list : []) put(normalizeV2(m));
   } catch (error) {
-    log('catalog /v2 models failed', error?.message || error);
+    log('catalog /v2 models shaping failed', error?.message || error);
   }
   return [...out.values()];
+}
+
+export async function fetchCatalog(auth) {
+  const [v3, v2] = await Promise.all([
+    upstreamGet(auth, '/v3/config').catch((error) => {
+      log('catalog /v3/config failed', error?.message || error);
+      return null;
+    }),
+    upstreamGet(auth, '/v2/enterprises/personal/models').catch((error) => {
+      log('catalog /v2 models failed', error?.message || error);
+      return null;
+    }),
+  ]);
+  return shapeCatalog(v3, v2);
 }
 
 function num(v) {
@@ -749,17 +791,35 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
+/**
+ * v3 目录条目 → 统一字段。
+ *
+ * ⚠️ v3 的字段是**驼峰**（`maxInputTokens` / `maxOutputTokens` /
+ * `supportsImages` / `reasoning.supportedEfforts` / `descriptionZh`）——
+ * 只认下划线命名会把全部容量信息映射成 0，下游（dsh 的 compaction）拿到
+ * 「无上下文容量」直接拒绝切模型。两个命名体系都认，防上游改写法。
+ */
 function normalizeV3(m) {
   const id = String(m.id || m.model || m.name || '');
+  const reasoning = m.reasoning && typeof m.reasoning === 'object' ? m.reasoning : {};
+  const efforts = Array.isArray(reasoning.supportedEfforts)
+    ? reasoning.supportedEfforts.map((e) => String(e || '').trim()).filter(Boolean)
+    : [];
   return {
     id,
     name: String(m.name || m.display_name || id),
-    context_window: num(m.max_input_tokens || m.context_window || m.contextWindow),
-    max_output_tokens: num(m.max_output_tokens || m.maxTokens),
-    supports_images: m.supports_images === true || m.supportsImages === true || m.vision === true,
-    supports_reasoning: m.supports_reasoning === true || m.supportsReasoning === true || m.reasoning === true,
+    context_window: num(m.maxInputTokens || m.max_input_tokens || m.context_window || m.contextWindow),
+    max_output_tokens: num(m.maxOutputTokens || m.max_output_tokens || m.maxTokens),
+    supports_images: m.supportsImages === true || m.supports_images === true || m.vision === true,
+    supports_reasoning: m.supportsReasoning === true || m.supports_reasoning === true || m.reasoning === true || efforts.length > 0,
+    reasoning_efforts: efforts,
+    default_reasoning_effort: typeof reasoning.defaultEffort === 'string' ? reasoning.defaultEffort : '',
+    only_reasoning: m.onlyReasoning === true || m.only_reasoning === true,
+    default_temperature: m.temperature != null && Number.isFinite(Number(m.temperature)) ? Number(m.temperature) : '',
+    credits: typeof m.credits === 'string' ? m.credits : (typeof m.credits === 'number' ? m.credits : ''),
     vendor: m.vendor ? String(m.vendor) : '',
-    description_zh: String(m.description_zh || m.description || ''),
+    description_zh: String(m.descriptionZh || m.description_zh || m.description || ''),
+    description_en: String(m.descriptionEn || m.description_en || ''),
     official: true,
   };
 }
@@ -875,13 +935,25 @@ function costLabel(m) {
   return n === 0 ? '免费' : `×${n}`;
 }
 
+/** token 容量 → 短文本：1_000_000 → 1M，128_000 → 128K，8_192 → 8192。 */
+function shortCount(n) {
+  const value = Number(n);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  if (value >= 1_000_000) {
+    const m = Math.round(value / 100_000) / 10;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+  }
+  if (value >= 10_000) return `${Math.round(value / 1000)}K`;
+  return String(value);
+}
+
 function toOpenAiModel(m) {
   const cost = costLabel(m);
   const bits = [];
   const ctx = num(m.context_window);
   const out = num(m.max_output_tokens);
-  if (ctx > 0) bits.push(`上下文 ${Math.round(ctx / 1000)}K`);
-  if (out > 0) bits.push(`输出 ${Math.round(out / 1000)}K`);
+  if (ctx > 0) bits.push(`上下文 ${shortCount(ctx)}`);
+  if (out > 0) bits.push(`输出 ${shortCount(out)}`);
   if (m.supports_images === true) bits.push('图片');
   if (m.supports_reasoning === true) bits.push('推理');
   return {

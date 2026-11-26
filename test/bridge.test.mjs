@@ -20,6 +20,7 @@ import {
   normalizePayload,
   openEncryptedField,
   resolveAuthPath,
+  shapeCatalog,
   upstreamForDomain,
 } from '../plugin/bridge/wb-bridge.mjs';
 
@@ -178,6 +179,67 @@ test('resolveAuthPath: 无 env 时给出本机真实路径或空串（都不报�
   } finally {
     if (prev !== undefined) process.env.WORKBUDDY_AUTH_FILE = prev;
   }
+});
+
+// ── 目录整形：v3 驼峰字段 + 不覆盖合并 ─────────────────────────────────
+
+test('shapeCatalog: v3 的驼峰容量字段必须被映射（下划线写法全是 0）', () => {
+  // 真实事故：v3 用 maxInputTokens/maxOutputTokens（驼峰），只认下划线会把
+  // 容量映射成 0，dsh 侧表现为「no context capacity」拒绝切模型。
+  const [m] = shapeCatalog({
+    data: {
+      models: [{
+        id: 'hy4flash-free',
+        name: 'Hy4 flash',
+        maxInputTokens: 960000,
+        maxOutputTokens: 64000,
+        supportsImages: true,
+        supportsReasoning: true,
+        credits: 'x0.00 credits',
+        descriptionZh: '更轻量的日常主力模型',
+        temperature: 0.9,
+        reasoning: { supportedEfforts: ['high'], defaultEffort: 'high' },
+      }],
+    },
+  }, null);
+  assert.equal(m.context_window, 960000);
+  assert.equal(m.max_output_tokens, 64000);
+  assert.equal(m.supports_images, true);
+  assert.equal(m.supports_reasoning, true);
+  assert.equal(m.credits, 'x0.00 credits');
+  assert.equal(m.description_zh, '更轻量的日常主力模型');
+  assert.deepEqual(m.reasoning_efforts, ['high']);
+  assert.equal(m.default_reasoning_effort, 'high');
+  assert.equal(m.default_temperature, 0.9);
+  assert.equal(m.official, true);
+});
+
+test('shapeCatalog: v2 的 0/空值不得覆盖 v3 的真值', () => {
+  // v2 大量字段缺失会归一成 0；无条件覆盖会把 960000 盖成 0
+  const [m] = shapeCatalog({
+    data: { models: [{ id: 'glm-5.3', name: 'GLM-5.3', maxInputTokens: 200000, maxOutputTokens: 128000, supportsImages: true }] },
+  }, {
+    data: { models: [{ id: 'glm-5.3', name: 'GLM-5.3', credits: 'x0.69 credits', context_window: 0, max_output_tokens: 0, supports_images: false }] },
+  });
+  assert.equal(m.context_window, 200000, 'v3 的真容量不能被 v2 的 0 盖掉');
+  assert.equal(m.max_output_tokens, 128000);
+  assert.equal(m.supports_images, true);
+  assert.equal(m.credits, 'x0.69 credits', 'v2 有的字段（倍率）要补上');
+});
+
+test('shapeCatalog: v2 独有的型号照样进目录', () => {
+  const out = shapeCatalog({ data: { models: [] } }, {
+    data: { models: [{ id: 'minimax-m2.7', name: 'MiniMax-M2.7', credits: 'x0.2 credits' }] },
+  });
+  assert.equal(out.length, 1);
+  assert.equal(out[0].id, 'minimax-m2.7');
+  assert.equal(out[0].credits, 'x0.2 credits');
+});
+
+test('shapeCatalog: 两端都失败/空数据不炸', () => {
+  assert.deepEqual(shapeCatalog(null, null), []);
+  assert.deepEqual(shapeCatalog({}, {}), []);
+  assert.deepEqual(shapeCatalog({ data: {} }, { data: { models: 'x' } }), []);
 });
 
 // ── 真机集成（有登录文件 + 客户端才跑；CI/未登录机器上自动跳过） ──────

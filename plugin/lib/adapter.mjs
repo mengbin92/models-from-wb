@@ -431,6 +431,28 @@ class StreamTranslator {
 const NON_CHAT_RE = /embedding|rerank|moderation|tts|whisper|image|video|default-model|^default$|enhance-/i;
 
 /**
+ * 目录没给上下文容量时，`resolveModel` 用的**保守**下限。
+ *
+ * dsh 的 compaction-basic 拿不到 contextWindow 就拒绝切模型
+ * （"no context capacity … configure contextWindow on that adapter model"）。
+ * 给一个下限好过什么都不给：低估容量只会让 dsh 更早压缩（安全方向），
+ * 高估会把超长请求发给上游、换一个 400。真实容量永远优先。
+ */
+export const FALLBACK_CONTEXT_WINDOW = 32_768;
+
+/** token 容量 → 短文本：1_000_000 → 1M，128_000 → 128K，8_192 → 8192。 */
+function shortCount(n) {
+  const value = Number(n);
+  if (!Number.isFinite(value) || value <= 0) return '';
+  if (value >= 1_000_000) {
+    const m = Math.round(value / 100_000) / 10;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+  }
+  if (value >= 10_000) return `${Math.round(value / 1000)}K`;
+  return String(value);
+}
+
+/**
  * 积分倍率数值；`null` = 上游没给（**未知，不是 0**）。
  * 免费判定只认显式事实：数值 0、`x0.00`、或 `free:true`。
  */
@@ -509,8 +531,8 @@ export function toModelInfo(m) {
   const bits = [];
   const ctx = Number(m.context_window) || 0;
   const out = Number(m.max_output_tokens) || 0;
-  if (ctx > 0) bits.push(`上下文 ${Math.round(ctx / 1000)}K`);
-  if (out > 0) bits.push(`输出 ${Math.round(out / 1000)}K`);
+  if (ctx > 0) bits.push(`上下文 ${shortCount(ctx)}`);
+  if (out > 0) bits.push(`输出 ${shortCount(out)}`);
   if (m.supports_images === true) bits.push('图片');
   if (m.supports_reasoning === true) bits.push('推理');
   const credit = creditLabel(m);
@@ -635,10 +657,13 @@ export class WorkBuddyAdapter {
     } catch (error) {
       if (signal?.aborted) throw error;
       this.log('resolveModel catalog failed; using minimal model info', String(error?.message || error));
-      return { provider, id: model, name: model };
+      // 目录失败也不能没有容量： compaction 会因「无上下文容量」拒绝切模型
+      return { provider, id: model, name: model, context: { contextWindow: FALLBACK_CONTEXT_WINDOW } };
     }
     const hit = catalog.find((m) => m && m.id === model);
-    if (!hit) return { provider, id: model, name: model };
+    if (!hit) {
+      return { provider, id: model, name: model, context: { contextWindow: FALLBACK_CONTEXT_WINDOW } };
+    }
     const info = toModelInfo(hit);
     const ctx = Number(hit.context_window) || 0;
     const maxTokens = Number(hit.max_output_tokens) || 0;
@@ -647,7 +672,8 @@ export class WorkBuddyAdapter {
       id: model,
       name: info.name,
       ...(info.description ? { description: info.description } : {}),
-      ...(ctx > 0 ? { context: { contextWindow: ctx } } : {}),
+      // 容量**必须**给：缺了 compaction 直接拒绝切模型（见 FALLBACK 注释）
+      context: { contextWindow: ctx > 0 ? ctx : FALLBACK_CONTEXT_WINDOW },
       ...(maxTokens > 0 ? { defaultMaxTokens: maxTokens } : {}),
       inputModalities: info.inputModalities,
     };
