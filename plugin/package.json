@@ -1,6 +1,6 @@
 {
   "name": "models-from-wb",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "DeepSeek Harness 插件：把本机 WorkBuddy 桌面端已登录的模型（DeepSeek / GLM / Kimi / MiniMax / 混元等）经本地桥原生接进 dsh —— 运行时注册 workbuddy 路由，模型直接出现在模型选择器。",
   "type": "module",
